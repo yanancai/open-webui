@@ -1,20 +1,15 @@
 """
-Open WebUI Filter Extension: Ollama Logprob Interactive Heatmap Generator
-This Filter Function captures model response tokens and logprobs data
-from Ollama's API and generates interactive HTML artifacts for visualization.
+Open WebUI Filter Extension: Token Probability Interactive Heatmap Generator
+This Filter Function captures model response tokens and logprobs data and generates 
+interactive HTML artifacts for visualization.
 
-Compatible with:
-- Ollama's /api/chat endpoint (native format)
-- Ollama's /api/generate endpoint (native format)
-- Ollama's OpenAI-compatible /v1/chat/completions endpoint (OpenAI format)
+Compatible with all LLM providers through Open WebUI's unified OpenAI-compatible format.
 
-Input formats supported:
-- Native Ollama: {"options": {"logprobs": true, "top_logprobs": 5}}
+Input format:
 - OpenAI-compatible: {"logprobs": true, "top_logprobs": 5}
 
-Output formats supported:
-- Native Ollama: logprobs in message.logprobs or response.logprobs
-- OpenAI-compatible: logprobs in choices[0].logprobs.content[]
+Output format:
+- OpenAI-compatible: logprobs in choices[0].logprobs.content[] (streaming) or message.logprobs (final)
 
 Focus: Generates interactive HTML artifacts with token probability heatmaps and confidence analysis.
 """
@@ -33,12 +28,9 @@ class Filter:
         priority: int = Field(default=0, description="Priority level for this filter")
         top_k: int = Field(
             default=5, 
-            description="Number of top alternative tokens to capture for code artifacts (0-20)",
+            description="Number of top alternative tokens to capture for heatmap visualization (0-20)",
             ge=0,
             le=20
-        )
-        enable_streaming_logprobs: bool = Field(
-            default=True, description="Enable logprobs for streaming requests (may cause server issues on older versions)"
         )
 
     def __init__(self):
@@ -46,9 +38,12 @@ class Filter:
         self.toggle = True # IMPORTANT: This creates a switch UI in Open WebUI
         # TIP: Use SVG Data URI!
         self.icon = """data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGZpbGw9Im5vbmUiIHZpZXdCb3g9IjAgMCAyNCAyNCIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBjbGFzcz0ic2l6ZS02Ij4KICA8cGF0aCBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGQ9Ik0xMiAxOHYtNS4yNW0wIDBhNi4wMSA2LjAxIDAgMCAwIDEuNS0uMTg5bS0xLjUuMTg5YTYuMDEgNi4wMSAwIDAgMS0xLjUtLjE4OW0zLjc1IDcuNDc4YTEyLjA2IDEyLjA2IDAgMCAxLTQuNSAwbTMuNzUgMi4zODNhMTQuNDA2IDE0LjQwNiAwIDAgMS0zIDBNMTQuMjUgMTh2LS4xOTJjMC0uOTgzLjY1OC0xLjgyMyAxLjUwOC0yLjMxNmE3LjUgNy41IDAgMSAwLTcuNTE3IDBjLjg1LjQ5MyAxLjUwOSAxLjMzMyAxLjUwOSAyLjMxNlYxOCIgLz4KPC9zdmc+Cg=="""
-        # Set up logging
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
+        
+        # Set up logging without interfering with Open WebUI's configuration
+        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        # Only set level if not already configured to avoid conflicts
+        if not self.logger.handlers:
+            self.logger.setLevel(logging.INFO)
         
         # State tracking for streaming responses
         self.streaming_state = {}
@@ -58,39 +53,33 @@ class Filter:
 
     def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         """
-        Modify the request to ensure logprobs are requested if toggle is enabled
+        Modify the request to ensure logprobs are requested if toggle is enabled.
+        Open WebUI always uses OpenAI-compatible format for filter functions.
         """
+        # Immediately return if disabled - no processing at all
         if not self.toggle:
             return body
         
-        # Check for new conversation turn and refresh state if needed
-        self._detect_and_handle_conversation_turn(body)
+        try:
+            # Check for new conversation turn and refresh state if needed
+            self._detect_and_handle_conversation_turn(body)
+            
+            # Periodic resource cleanup to prevent memory leaks
+            if hasattr(self, '_last_cleanup'):
+                if time.time() - self._last_cleanup > 60:  # Cleanup every minute
+                    self._cleanup_resources()
+                    self._last_cleanup = time.time()
+            else:
+                self._last_cleanup = time.time()
 
-        # Check if this is a streaming request
-        is_streaming = body.get("stream", False)
-        
-        # Detect if this is an OpenAI-compatible request (has "messages" field)
-        is_openai_format = "messages" in body
-
-        # For streaming requests, only add logprobs if enabled and supported
-        if is_streaming and not self.valves.enable_streaming_logprobs:
-            return body
-
-        # Handle OpenAI-compatible format
-        if is_openai_format:
-            # For OpenAI format, logprobs parameters are at the top level
+            # Open WebUI uses OpenAI-compatible format for filter functions
+            # Add logprobs parameters at the top level
             if "logprobs" not in body:
                 body["logprobs"] = True
                 body["top_logprobs"] = min(max(self.valves.top_k, 0), 20)
-        else:
-            # Handle Ollama native format
-            if "options" not in body:
-                body["options"] = {}
-            
-            # Only set logprobs if not already configured by the user
-            if "logprobs" not in body["options"]:
-                body["options"]["logprobs"] = True
-                body["options"]["top_logprobs"] = min(max(self.valves.top_k, 0), 20)
+        except Exception as e:
+            # If anything fails, just return the original body
+            pass
 
         return body
 
@@ -98,7 +87,9 @@ class Filter:
         """
         Process the response and add heatmap visualization if logprobs are present.
         Only processes NEW messages to prevent duplicate artifacts.
+        Open WebUI provides responses in a normalized format with logprobs already extracted.
         """
+        # Immediately return if disabled - no processing at all
         if not self.toggle:
             return body
 
@@ -109,9 +100,11 @@ class Filter:
                 
                 # Get chat context for artifact refresh logic
                 chat_id = body.get("chat_id", "unknown")
-                self.logger.info(f"🔍 MESSAGE MANAGEMENT - Processing chat: {chat_id}")
-                self.logger.info(f"🔍 Current conversation state: chat_id={self.current_chat_id}, turn={self.conversation_turn_count}")
-                self.logger.info(f"🔍 Processed messages count: {len(self.processed_messages)}")
+                # Reduce verbose logging to prevent performance issues
+                if len(self.processed_messages) % 10 == 0:  # Log every 10 messages
+                    print(f"🔍 MESSAGE MANAGEMENT - Processing chat: {chat_id}")
+                    print(f"🔍 Current conversation state: chat_id={self.current_chat_id}, turn={self.conversation_turn_count}")
+                    print(f"🔍 Processed messages count: {len(self.processed_messages)}")
                 
                 # Find assistant messages with logprobs, but only process NEW ones (not already processed)
                 new_assistant_messages = []
@@ -122,14 +115,15 @@ class Filter:
                         base_message_key = f"{chat_id}:{message_id}"
                         already_processed = any(key.startswith(base_message_key) for key in self.processed_messages)
                         
-                        self.logger.info(f"🆔 FOUND assistant message - ID: {message_id}")
-                        self.logger.info(f"📊 Logprobs present: {bool(message.get('logprobs'))}")
-                        self.logger.info(f"🔍 Already processed (any version): {already_processed}")
+                        # Reduce verbose logging to prevent performance issues
+                        if not already_processed:
+                            print(f"🆔 FOUND new assistant message - ID: {message_id}")
+                            print(f"📊 Logprobs present: {bool(message.get('logprobs'))}")
                         
                         if not already_processed:
                             new_assistant_messages.append(message)
                         else:
-                            self.logger.info(f"⚠️ SKIPPING already processed message: {message_id}")
+                            print(f"⚠️ SKIPPING already processed message: {message_id}")
                 
                 # Process only the NEW assistant messages (typically just one per turn)
                 for message in new_assistant_messages:
@@ -141,25 +135,21 @@ class Filter:
                         # Create a unique key for this specific message
                         unique_message_key = f"{chat_id}:{message_id}:processed"
                         
-                        self.logger.info(f"🔑 PROCESSING NEW MESSAGE: {unique_message_key}")
-                        self.logger.info(f"🆔 Message ID: {message_id}")
-                        self.logger.info(f"📝 Content length: {len(content)} chars")
-                        self.logger.info(f"📊 Logprobs tokens: {len(logprobs_data) if logprobs_data else 0}")
+                        print(f"🔑 PROCESSING NEW MESSAGE: {message_id}")
+                        print(f"📝 Content length: {len(content)} chars")
+                        print(f"📊 Logprobs tokens: {len(logprobs_data) if logprobs_data else 0}")
                         
                         # Mark this specific message as processed
                         self.processed_messages.add(unique_message_key)
-                        self.logger.info(f"✅ MARKED AS PROCESSED: {unique_message_key}")
-                        self.logger.info(f"📊 New processed count: {len(self.processed_messages)}")
+                        print(f"✅ MARKED AS PROCESSED: {unique_message_key}")
                         
                         # Generate heatmap HTML for this new message
-                        heatmap_html = self._create_heatmap_html_ollama(content, logprobs_data, self.conversation_turn_count)
+                        heatmap_html = self._create_heatmap_html(content, logprobs_data, self.conversation_turn_count)
                         
                         if heatmap_html:
                             # Append the heatmap to the message content
                             message["content"] = content + "\n\n" + heatmap_html
-                            self.logger.info(f"✅ ARTIFACT GENERATED for NEW message {message_id} (turn {self.conversation_turn_count})")
-                        else:
-                            self.logger.warning("❌ Heatmap generation returned empty result")
+                            print(f"✅ ARTIFACT GENERATED for NEW message {message_id} (turn {self.conversation_turn_count})")
                         
                         # Keep logprobs for UI access
                         if not message.get("logprobs"):
@@ -168,29 +158,37 @@ class Filter:
                         # Process only the first new message to avoid multiple artifacts per turn
                         break
                     elif not logprobs_data:
-                        self.logger.warning(f"⚠️ No logprobs found in NEW message {message_id}")
+                        print(f"⚠️ No logprobs found in NEW message {message_id}")
                     elif not content.strip():
-                        self.logger.info(f"⚠️ NEW message {message_id} has logprobs but no content")
+                        print(f"⚠️ NEW message {message_id} has logprobs but no content")
+                
+                # Clean up processed messages more aggressively to prevent memory leaks
+                if len(self.processed_messages) > 100:
+                    # Keep only the most recent 50 processed messages
+                    recent_messages = list(self.processed_messages)[-50:]
+                    self.processed_messages = set(recent_messages)
+                    print(f"🧹 Cleaned up processed messages cache: {len(self.processed_messages)} entries remaining")
                 
                 if not new_assistant_messages:
-                    self.logger.info("⚠️ No NEW assistant messages with logprobs found")
+                    print("⚠️ No NEW assistant messages with logprobs found")
                 
                 return body
 
-            # Handle other response structures (legacy code for other API formats)
-            self.logger.warning("⚠️ Unknown response structure, returning original")
+            # Handle other response structures if needed
+            print("⚠️ Unknown response structure, returning original")
 
         except Exception as e:
-            self.logger.error(f"❌ Error processing logprobs: {e}")
-            import traceback
-            self.logger.error(f"❌ Traceback: {traceback.format_exc()}")
+            # Log error but don't let it break the response
+            print(f"❌ Error processing logprobs: {e}")
 
         return body
 
     def stream(self, event: dict) -> dict:
         """
-        Process streaming chunks in real-time to build incremental heatmap visualization
+        Process streaming chunks in real-time to build incremental heatmap visualization.
+        Open WebUI provides streaming data in OpenAI-compatible format.
         """
+        # Immediately return if disabled - no processing at all
         if not self.toggle:
             return event
             
@@ -200,7 +198,7 @@ class Filter:
             
             # Track conversation changes
             if self.current_chat_id != chat_id:
-                self.logger.info(f"🔄 STREAM CONVERSATION CHANGE: {self.current_chat_id} -> {chat_id}")
+                print(f"🔄 STREAM CONVERSATION CHANGE: {self.current_chat_id} -> {chat_id}")
                 self.current_chat_id = chat_id
                 self.conversation_turn_count += 1
             
@@ -235,7 +233,7 @@ class Filter:
                     content_chunk = delta["content"]
                     state["content_so_far"] += content_chunk
                 
-                # Handle logprobs updates  
+                # Handle logprobs updates (OpenAI format)
                 logprobs = delta.get("logprobs")
                 if logprobs:
                     state["logprob_chunks"] += 1
@@ -254,38 +252,25 @@ class Filter:
                                     state["tokens"].append(token)
                                     state["logprobs"].append(logprob)
                                     state["top_logprobs"].append(top_logprobs)
-                    
-                    # Handle Ollama native format: direct logprobs array
-                    elif isinstance(logprobs, list):
-                        for token_idx, token_logprob in enumerate(logprobs):
-                            if isinstance(token_logprob, dict):
-                                token = token_logprob.get("token", "")
-                                logprob = token_logprob.get("logprob", None)
-                                top_logprobs = token_logprob.get("top_logprobs", [])
-                                
-                                state["tokens"].append(token)
-                                state["logprobs"].append(logprob)
-                                state["top_logprobs"].append(top_logprobs)
                 
                 # Check if this is the final chunk
                 finish_reason = choice.get("finish_reason")
                 if finish_reason:
-                    self.logger.info(f"🏁 STREAM FINISHED for chat {chat_id} - turn {self.conversation_turn_count}")
+                    print(f"🏁 STREAM FINISHED for chat {chat_id} - turn {self.conversation_turn_count}")
                     
-                    # Clean up the streaming state
+                    # Clean up the streaming state immediately
                     if chat_id in self.streaming_state:
                         del self.streaming_state[chat_id]
                     
-                    # Clean up old processed messages (keep only recent ones)
-                    if len(self.processed_messages) > 200:
-                        recent_messages = list(self.processed_messages)[-100:]
+                    # Clean up old processed messages more aggressively (keep only recent ones)
+                    if len(self.processed_messages) > 150:
+                        recent_messages = list(self.processed_messages)[-75:]
                         self.processed_messages = set(recent_messages)
-                        self.logger.info(f"🧹 Cleaned up processed messages cache: {len(self.processed_messages)} entries remaining")
+                        print(f"🧹 Stream cleanup: processed messages cache reduced to {len(self.processed_messages)} entries")
                         
         except Exception as e:
-            self.logger.error(f"❌ ERROR in stream processing: {e}")
-            import traceback
-            self.logger.error(f"❌ Traceback: {traceback.format_exc()}")
+            # Log error but don't let it break streaming
+            print(f"❌ ERROR in stream processing: {e}")
             
         return event
 
@@ -308,32 +293,34 @@ class Filter:
                     chat_id = msg["chat_id"]
                     break
         
-        self.logger.info(f"🔍 CONVERSATION TURN DETECTION:")
-        self.logger.info(f"   - Detected chat_id: {chat_id}")
-        self.logger.info(f"   - Current tracked chat_id: {self.current_chat_id}")
-        self.logger.info(f"   - Current turn count: {self.conversation_turn_count}")
+        print(f"🔍 CONVERSATION TURN DETECTION:")
+        print(f"   - Detected chat_id: {chat_id}")
+        print(f"   - Current tracked chat_id: {self.current_chat_id}")
+        # Only log turn count if it's a new conversation or significant milestone
+        if chat_id != self.current_chat_id or self.conversation_turn_count % 5 == 0:
+            print(f"   - Current turn count: {self.conversation_turn_count}")
         
         # Check if this is a new conversation or a new turn
         if chat_id and chat_id != self.current_chat_id:
-            self.logger.info(f"🔄 NEW CONVERSATION DETECTED!")
-            self.logger.info(f"   - Previous: {self.current_chat_id}")
-            self.logger.info(f"   - New: {chat_id}")
+            print(f"🔄 NEW CONVERSATION DETECTED!")
+            print(f"   - Previous: {self.current_chat_id}")
+            print(f"   - New: {chat_id}")
             
             # Refresh state for new conversation
             self._refresh_conversation_state(chat_id)
             
         elif chat_id:
             # Same conversation, increment turn count for artifact versioning
-            self.logger.info(f"🗨️ CONTINUING CONVERSATION {chat_id}")
             self.conversation_turn_count += 1
-            self.logger.info(f"📊 Updated turn count: {self.conversation_turn_count}")
-            self.logger.info(f"🔄 Chat {chat_id} ready for turn {self.conversation_turn_count}")
+            # Only log every few turns to reduce verbosity
+            if self.conversation_turn_count % 3 == 0:
+                print(f"�️ CONTINUING CONVERSATION {chat_id} - Turn {self.conversation_turn_count}")
         else:
-            self.logger.info(f"⚠️ No chat_id detected in request body")
-            self.logger.info(f"📦 Request body keys: {list(body.keys())}")
+            print(f"⚠️ No chat_id detected in request body")
+            print(f"📦 Request body keys: {list(body.keys())}")
             # For requests without chat_id, still try to clean some artifacts to be safe
             if len(self.processed_messages) > 0:
-                self.logger.info(f"🧹 Clearing some processed messages as fallback")
+                print(f"🧹 Clearing some processed messages as fallback")
                 # Keep only half to be conservative
                 recent_messages = list(self.processed_messages)[-50:]
                 self.processed_messages = set(recent_messages)
@@ -342,7 +329,7 @@ class Filter:
         """
         Refresh all state when a new conversation is detected
         """
-        self.logger.info(f"🔄 REFRESHING CONVERSATION STATE for chat: {new_chat_id}")
+        print(f"🔄 REFRESHING CONVERSATION STATE for chat: {new_chat_id}")
         
         # Update tracking
         old_chat_id = self.current_chat_id
@@ -354,22 +341,49 @@ class Filter:
             # Remove messages from the old conversation to allow fresh artifacts
             old_messages = {msg_key for msg_key in self.processed_messages if msg_key.startswith(f"{old_chat_id}:")}
             self.processed_messages -= old_messages
-            self.logger.info(f"🧹 Cleared {len(old_messages)} processed messages from previous conversation")
+            print(f"🧹 Cleared {len(old_messages)} processed messages from previous conversation")
         
         # Clear any streaming state from previous conversation
         if old_chat_id in self.streaming_state:
             del self.streaming_state[old_chat_id]
-            self.logger.info(f"🧹 Cleared streaming state from previous conversation")
+            print(f"🧹 Cleared streaming state from previous conversation")
         
-        self.logger.info(f"✅ State refreshed - ready for new conversation {new_chat_id}")
+        print(f"✅ State refreshed - ready for new conversation {new_chat_id}")
 
-    def _create_heatmap_html_ollama(self, content: str, logprobs_data: list, turn: int) -> str:
+    def _cleanup_resources(self) -> None:
         """
-        Create HTML with heatmap styling based on Ollama's logprobs format with turn-based versioning
+        Perform aggressive cleanup to prevent memory leaks and resource issues
         """
-        # Ollama format: direct array of TokenLogprob objects
+        try:
+            # Clean up old streaming states
+            current_time = time.time()
+            stale_chats = []
+            
+            for chat_id, state in self.streaming_state.items():
+                # Remove streams older than 5 minutes
+                if state.get("start_time") and (current_time - state["start_time"]) > 300:
+                    stale_chats.append(chat_id)
+            
+            for chat_id in stale_chats:
+                del self.streaming_state[chat_id]
+                print(f"🧹 Removed stale streaming state for chat: {chat_id}")
+            
+            # Keep only the most recent 25 processed messages to prevent unbounded growth
+            if len(self.processed_messages) > 50:
+                recent_messages = list(self.processed_messages)[-25:]
+                self.processed_messages = set(recent_messages)
+                print(f"🧹 Aggressive cleanup: reduced to {len(self.processed_messages)} processed messages")
+                
+        except Exception as e:
+            print(f"⚠️ Error during resource cleanup: {e}")
+
+    def _create_heatmap_html(self, content: str, logprobs_data: list, turn: int) -> str:
+        """
+        Create HTML with heatmap styling based on OpenAI-compatible logprobs format with turn-based versioning.
+        In Open WebUI's outlet, logprobs_data is already extracted and normalized to a consistent format.
+        """
         if not isinstance(logprobs_data, list) or not logprobs_data:
-            self.logger.warning("Invalid logprobs data format for Ollama")
+            print("Invalid logprobs data format")
             return content
 
         tokens = []
@@ -391,7 +405,7 @@ class Filter:
 
         # Validate that we have matching data
         if len(tokens) != len(token_logprobs):
-            self.logger.warning(f"Token count mismatch: {len(tokens)} tokens vs {len(token_logprobs)} logprobs")
+            print(f"Token count mismatch: {len(tokens)} tokens vs {len(token_logprobs)} logprobs")
             # Truncate to minimum length
             min_len = min(len(tokens), len(token_logprobs))
             tokens = tokens[:min_len]
@@ -708,6 +722,6 @@ class Filter:
 
 
 # Required metadata for Open WebUI
-__version__ = "6.1.0"
+__version__ = "7.1.0"
 __author__ = "Assistant"
-__description__ = "Captures Ollama model response tokens and logprobs data to generate interactive HTML artifacts. Creates beautiful, hoverable heatmap visualizations with confidence analysis and detailed statistics. Features NEW MESSAGE ONLY processing to prevent duplicate artifacts. Each conversation turn gets its own unique artifact. Fully compatible with Open WebUI's artifact system."
+__description__ = "Captures model response tokens and logprobs data to generate interactive HTML artifacts. Creates beautiful, hoverable heatmap visualizations with confidence analysis and detailed statistics. Features NEW MESSAGE ONLY processing to prevent duplicate artifacts. Each conversation turn gets its own unique artifact. Works with all LLM providers through Open WebUI's unified OpenAI-compatible format."

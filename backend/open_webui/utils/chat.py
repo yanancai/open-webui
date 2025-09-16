@@ -49,6 +49,7 @@ from open_webui.utils.payload import convert_payload_openai_to_ollama
 from open_webui.utils.response import (
     convert_response_ollama_to_openai,
     convert_streaming_response_ollama_to_openai,
+    convert_streaming_ollama_to_complete_response,
 )
 from open_webui.utils.filter import (
     get_sorted_filter_ids,

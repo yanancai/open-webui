@@ -1956,7 +1956,6 @@ async def process_chat_response(
                     )
 
                 async def stream_body_handler(response, form_data):
-                    print(f"[DEBUG] stream_body_handler called - chat_id: {metadata.get('chat_id', 'N/A')}, message_id: {metadata.get('message_id', 'N/A')}")
                     nonlocal content
                     nonlocal content_blocks
                     nonlocal accumulated_logprobs
@@ -1977,7 +1976,9 @@ async def process_chat_response(
                         nonlocal delta_count
                         nonlocal last_delta_data
 
+                        print(f"[DEBUG] flush_pending_delta_data called - delta_count: {delta_count}, threshold: {threshold}, has_data: {last_delta_data is not None}")
                         if delta_count >= threshold and last_delta_data:
+                            print(f"[DEBUG] Emitting buffered data: {last_delta_data}")
                             await event_emitter(
                                 {
                                     "type": "chat:completion",
@@ -1986,6 +1987,8 @@ async def process_chat_response(
                             )
                             delta_count = 0
                             last_delta_data = None
+                        else:
+                            print(f"[DEBUG] No data to flush - delta_count: {delta_count}, threshold: {threshold}")
 
                     async for line in response.body_iterator:
                         line = line.decode("utf-8") if isinstance(line, bytes) else line
@@ -2003,7 +2006,12 @@ async def process_chat_response(
                         data = data[len("data:") :].strip()
 
                         try:
+                            # Check if data is valid JSON before parsing
+                            if not data.strip() or data.strip() == "[DONE]":
+                                continue
+                                
                             data = json.loads(data)
+                            print(f"[DEBUG] Parsed JSON data: {data}")
 
                             data, _ = await process_filter_functions(
                                 request=request,
@@ -2012,8 +2020,10 @@ async def process_chat_response(
                                 form_data=data,
                                 extra_params={"__body__": form_data, **extra_params},
                             )
+                            print(f"[DEBUG] After filter processing: {data}")
 
                             if data:
+                                print(f"[DEBUG] Data exists, processing...")
                                 if "event" in data:
                                     await event_emitter(data.get("event", {}))
 
@@ -2034,7 +2044,9 @@ async def process_chat_response(
                                     )
                                 else:
                                     choices = data.get("choices", [])
+                                    print(f"[DEBUG] Processing choices: {len(choices)} choices found")
                                     if not choices:
+                                        print(f"[DEBUG] No choices found, checking for error/usage...")
                                         error = data.get("error", {})
                                         if error:
                                             await event_emitter(
@@ -2062,20 +2074,26 @@ async def process_chat_response(
                                         continue
 
                                     delta = choices[0].get("delta", {})
+                                    print(f"[DEBUG] Extracted delta: {delta}")
+                                    
+                                    # Initialize data variable to avoid UnboundLocalError
+                                    data = {}
+                                    print(f"[DEBUG] Initialized data variable")
                                     
                                     # Extract logprobs from choice level (Ollama converted format)
-                                    choice_logprobs = choices[0].get("logprobs", {}).get("content", [])
+                                    choice_logprobs_obj = choices[0].get("logprobs") or {}
+                                    choice_logprobs = choice_logprobs_obj.get("content", []) if isinstance(choice_logprobs_obj, dict) else []
                                     if choice_logprobs:
-                                        print(f"[DEBUG] Found logprobs in choice: {choice_logprobs}")
                                         if isinstance(choice_logprobs, list):
                                             accumulated_logprobs.extend(choice_logprobs)
                                         else:
                                             accumulated_logprobs.append(choice_logprobs)
-                                        print(f"[DEBUG] Accumulated logprobs now: {len(accumulated_logprobs)} items")
                                     
                                     delta_tool_calls = delta.get("tool_calls", None)
+                                    print(f"[DEBUG] Checking tool calls: {delta_tool_calls}")
 
                                     if delta_tool_calls:
+                                        print(f"[DEBUG] Processing tool calls: {delta_tool_calls}")
                                         for delta_tool_call in delta_tool_calls:
                                             tool_call_index = delta_tool_call.get(
                                                 "index"
@@ -2133,18 +2151,17 @@ async def process_chat_response(
                                                             "arguments"
                                                         ] += delta_arguments
 
+                                    print(f"[DEBUG] About to process content extraction")
                                     value = delta.get("content")
+                                    print(f"[DEBUG] Processing delta content: {repr(value)}")
                                     
                                     # Extract logprobs from streaming delta
                                     delta_logprobs = delta.get("logprobs")
-                                    print(f"[DEBUG] Processing delta - content: {repr(value)}, logprobs: {delta_logprobs}")
                                     if delta_logprobs:
-                                        print(f"[DEBUG] Found logprobs in delta: {delta_logprobs}")
                                         if isinstance(delta_logprobs, list):
                                             accumulated_logprobs.extend(delta_logprobs)
                                         else:
                                             accumulated_logprobs.append(delta_logprobs)
-                                        print(f"[DEBUG] Accumulated logprobs now: {len(accumulated_logprobs)} items")
 
                                     reasoning_content = (
                                         delta.get("reasoning_content")
@@ -2179,6 +2196,7 @@ async def process_chat_response(
                                         }
 
                                     if value:
+                                        print(f"[DEBUG] Processing value: {repr(value)}")
                                         if (
                                             content_blocks
                                             and content_blocks[-1]["type"]
@@ -2264,13 +2282,14 @@ async def process_chat_response(
                                                     content_blocks
                                                 ),
                                             }
+                                            print(f"[DEBUG] Created data with content: {data}")
+                                    else:
+                                        print(f"[DEBUG] No value to process, value is: {repr(value)}")
 
-                                if delta:
-                                    delta_count += 1
-                                    last_delta_data = data
-                                    if delta_count >= delta_chunk_size:
-                                        await flush_pending_delta_data(delta_chunk_size)
-                                else:
+                                # For streaming, we should emit content immediately, not buffer it
+                                # Similar to how non-streaming works
+                                if delta.get("content") or delta.get("tool_calls") or delta.get("reasoning_content"):
+                                    print(f"[DEBUG] Emitting streaming data immediately: {data}")
                                     await event_emitter(
                                         {
                                             "type": "chat:completion",
@@ -2278,6 +2297,9 @@ async def process_chat_response(
                                         }
                                     )
                         except Exception as e:
+                            print(f"[DEBUG] Exception in delta processing: {e}")
+                            import traceback
+                            print(f"[DEBUG] Traceback: {traceback.format_exc()}")
                             done = "data: [DONE]" in line
                             if done:
                                 pass
@@ -2323,7 +2345,6 @@ async def process_chat_response(
 
                 # Save accumulated logprobs to database after main streaming completes
                 if not ENABLE_REALTIME_CHAT_SAVE and accumulated_logprobs:
-                    print(f"[DEBUG] Main streaming completed - saving message with {len(accumulated_logprobs)} logprobs to database")
                     message_data = {
                         "content": serialize_content_blocks(content_blocks),
                         "logprobs": accumulated_logprobs,
@@ -2333,7 +2354,6 @@ async def process_chat_response(
                         metadata["message_id"],
                         message_data,
                     )
-                    print(f"[DEBUG] Main streaming logprobs saved to database successfully")
 
                 tool_call_retries = 0
 
