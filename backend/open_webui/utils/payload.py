@@ -350,6 +350,29 @@ def convert_payload_openai_to_ollama(openai_payload: dict) -> dict:
             format = schema.get("schema", None)
             ollama_payload["format"] = format
 
+    # Handle logprobs parameters for Ollama (check both top-level and options)
+    logprobs_to_add = {}
+    
+    # Check top-level first
+    if "logprobs" in openai_payload:
+        logprobs_to_add["logprobs"] = openai_payload["logprobs"]
+    if "top_logprobs" in openai_payload:
+        logprobs_to_add["top_logprobs"] = openai_payload["top_logprobs"]
+    
+    # Check in options field (added by filter functions)
+    if "options" in openai_payload:
+        options = openai_payload["options"]
+        if "logprobs" in options:
+            logprobs_to_add["logprobs"] = options["logprobs"]
+        if "top_logprobs" in options:
+            logprobs_to_add["top_logprobs"] = options["top_logprobs"]
+    
+    # Add logprobs to Ollama options if found
+    if logprobs_to_add:
+        ollama_options = ollama_payload.get("options", {})
+        ollama_options.update(logprobs_to_add)
+        ollama_payload["options"] = ollama_options
+
     return ollama_payload
 
 

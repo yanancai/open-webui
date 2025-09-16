@@ -1915,6 +1915,9 @@ async def process_chat_response(
                     "content": content,
                 }
             ]
+            
+            # Initialize accumulated logprobs for streaming response
+            accumulated_logprobs = []
 
             reasoning_tags_param = metadata.get("params", {}).get("reasoning_tags")
             DETECT_REASONING_TAGS = reasoning_tags_param is not False
@@ -1953,8 +1956,10 @@ async def process_chat_response(
                     )
 
                 async def stream_body_handler(response, form_data):
+                    print(f"[DEBUG] stream_body_handler called - chat_id: {metadata.get('chat_id', 'N/A')}, message_id: {metadata.get('message_id', 'N/A')}")
                     nonlocal content
                     nonlocal content_blocks
+                    nonlocal accumulated_logprobs
 
                     response_tool_calls = []
 
@@ -2057,6 +2062,17 @@ async def process_chat_response(
                                         continue
 
                                     delta = choices[0].get("delta", {})
+                                    
+                                    # Extract logprobs from choice level (Ollama converted format)
+                                    choice_logprobs = choices[0].get("logprobs", {}).get("content", [])
+                                    if choice_logprobs:
+                                        print(f"[DEBUG] Found logprobs in choice: {choice_logprobs}")
+                                        if isinstance(choice_logprobs, list):
+                                            accumulated_logprobs.extend(choice_logprobs)
+                                        else:
+                                            accumulated_logprobs.append(choice_logprobs)
+                                        print(f"[DEBUG] Accumulated logprobs now: {len(accumulated_logprobs)} items")
+                                    
                                     delta_tool_calls = delta.get("tool_calls", None)
 
                                     if delta_tool_calls:
@@ -2118,6 +2134,17 @@ async def process_chat_response(
                                                         ] += delta_arguments
 
                                     value = delta.get("content")
+                                    
+                                    # Extract logprobs from streaming delta
+                                    delta_logprobs = delta.get("logprobs")
+                                    print(f"[DEBUG] Processing delta - content: {repr(value)}, logprobs: {delta_logprobs}")
+                                    if delta_logprobs:
+                                        print(f"[DEBUG] Found logprobs in delta: {delta_logprobs}")
+                                        if isinstance(delta_logprobs, list):
+                                            accumulated_logprobs.extend(delta_logprobs)
+                                        else:
+                                            accumulated_logprobs.append(delta_logprobs)
+                                        print(f"[DEBUG] Accumulated logprobs now: {len(accumulated_logprobs)} items")
 
                                     reasoning_content = (
                                         delta.get("reasoning_content")
@@ -2293,6 +2320,20 @@ async def process_chat_response(
                         await response.background()
 
                 await stream_body_handler(response, form_data)
+
+                # Save accumulated logprobs to database after main streaming completes
+                if not ENABLE_REALTIME_CHAT_SAVE and accumulated_logprobs:
+                    print(f"[DEBUG] Main streaming completed - saving message with {len(accumulated_logprobs)} logprobs to database")
+                    message_data = {
+                        "content": serialize_content_blocks(content_blocks),
+                        "logprobs": accumulated_logprobs,
+                    }
+                    Chats.upsert_message_to_chat_by_id_and_message_id(
+                        metadata["chat_id"],
+                        metadata["message_id"],
+                        message_data,
+                    )
+                    print(f"[DEBUG] Main streaming logprobs saved to database successfully")
 
                 tool_call_retries = 0
 
@@ -2668,16 +2709,31 @@ async def process_chat_response(
                     "content": serialize_content_blocks(content_blocks),
                     "title": title,
                 }
+                
+                # Add accumulated logprobs to the final data if available
+                print(f"[DEBUG] Final data processing - accumulated_logprobs: {len(accumulated_logprobs) if accumulated_logprobs else 0} tokens")
+                if accumulated_logprobs:
+                    data["logprobs"] = accumulated_logprobs
 
+                print(f"[DEBUG] ENABLE_REALTIME_CHAT_SAVE: {ENABLE_REALTIME_CHAT_SAVE}")
                 if not ENABLE_REALTIME_CHAT_SAVE:
-                    # Save message in the database
+                    # Save message in the database with logprobs
+                    message_data = {
+                        "content": serialize_content_blocks(content_blocks),
+                    }
+                    if accumulated_logprobs:
+                        message_data["logprobs"] = accumulated_logprobs
+                        print(f"[DEBUG] Saving message with logprobs: {len(accumulated_logprobs)} tokens")
+                    else:
+                        print(f"[DEBUG] Saving message without logprobs")
+                        
+                    print(f"[DEBUG] Calling Chats.upsert_message_to_chat_by_id_and_message_id with: {message_data.keys()}")
                     Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
-                        {
-                            "content": serialize_content_blocks(content_blocks),
-                        },
+                        message_data,
                     )
+                    print(f"[DEBUG] Message saved to database")
 
                 # Send a webhook notification if the user is not active
                 if not get_active_status_by_user_id(user.id):
@@ -2708,18 +2764,23 @@ async def process_chat_response(
                 await event_emitter({"type": "chat:tasks:cancel"})
 
                 if not ENABLE_REALTIME_CHAT_SAVE:
-                    # Save message in the database
+                    # Save message in the database with logprobs if available
+                    message_data = {
+                        "content": serialize_content_blocks(content_blocks),
+                    }
+                    if accumulated_logprobs:
+                        message_data["logprobs"] = accumulated_logprobs
+                        
                     Chats.upsert_message_to_chat_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
-                        {
-                            "content": serialize_content_blocks(content_blocks),
-                        },
+                        message_data,
                     )
 
             if response.background is not None:
                 await response.background()
 
+        print(f"[DEBUG] response_handler completing - returning to main flow")
         return await response_handler(response, events)
 
     else:

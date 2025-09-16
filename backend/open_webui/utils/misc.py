@@ -212,6 +212,7 @@ def openai_chat_chunk_message_template(
     reasoning_content: Optional[str] = None,
     tool_calls: Optional[list[dict]] = None,
     usage: Optional[dict] = None,
+    logprobs: Optional[list[dict]] = None,
 ) -> dict:
     template = openai_chat_message_template(model)
     template["object"] = "chat.completion.chunk"
@@ -228,6 +229,10 @@ def openai_chat_chunk_message_template(
     if tool_calls:
         template["choices"][0]["delta"]["tool_calls"] = tool_calls
 
+    # Add logprobs to the choice if present
+    if logprobs:
+        template["choices"][0]["logprobs"] = {"content": logprobs}
+
     if not content and not reasoning_content and not tool_calls:
         template["choices"][0]["finish_reason"] = "stop"
 
@@ -242,6 +247,7 @@ def openai_chat_completion_message_template(
     reasoning_content: Optional[str] = None,
     tool_calls: Optional[list[dict]] = None,
     usage: Optional[dict] = None,
+    logprobs: Optional[list[dict]] = None,
 ) -> dict:
     template = openai_chat_message_template(model)
     template["object"] = "chat.completion"
@@ -252,6 +258,10 @@ def openai_chat_completion_message_template(
             **({"reasoning_content": reasoning_content} if reasoning_content else {}),
             **({"tool_calls": tool_calls} if tool_calls else {}),
         }
+
+    # Add logprobs to the choice if present
+    if logprobs:
+        template["choices"][0]["logprobs"] = {"content": logprobs}
 
     template["choices"][0]["finish_reason"] = "stop"
 

@@ -259,19 +259,33 @@ async def generate_chat_completion(
         if model.get("owned_by") == "ollama":
             # Using /ollama/api/chat endpoint
             form_data = convert_payload_openai_to_ollama(form_data)
+            
+            # Force streaming for Ollama when logprobs are requested (Ollama only returns logprobs in streaming mode)
+            original_stream = form_data.get("stream", False)
+            logprobs_requested = form_data.get("options", {}).get("logprobs", False)
+            if logprobs_requested and not original_stream:
+                print(f"[DEBUG] Forcing streaming for Ollama logprobs (originally stream={original_stream})")
+                form_data["stream"] = True
+            
             response = await generate_ollama_chat_completion(
                 request=request,
                 form_data=form_data,
                 user=user,
                 bypass_filter=bypass_filter,
             )
+            
             if form_data.get("stream"):
-                response.headers["content-type"] = "text/event-stream"
-                return StreamingResponse(
-                    convert_streaming_response_ollama_to_openai(response),
-                    headers=dict(response.headers),
-                    background=response.background,
-                )
+                if logprobs_requested and not original_stream:
+                    # Convert streaming to non-streaming for logprobs
+                    print(f"[DEBUG] Converting streaming response back to non-streaming for logprobs")
+                    return await convert_streaming_ollama_to_complete_response(response)
+                else:
+                    response.headers["content-type"] = "text/event-stream"
+                    return StreamingResponse(
+                        convert_streaming_response_ollama_to_openai(response),
+                        headers=dict(response.headers),
+                        background=response.background,
+                    )
             else:
                 return convert_response_ollama_to_openai(response)
         else:
@@ -303,6 +317,26 @@ async def chat_completed(request: Request, form_data: dict, user: Any):
         raise Exception("Model not found")
 
     model = models[model_id]
+
+    # Enrich messages with logprobs from database if available
+    if "messages" in data and "chat_id" in data:
+        try:
+            from open_webui.models.chats import Chats
+            db_messages = Chats.get_messages_by_chat_id(data["chat_id"])
+            log.debug(f"[LOGPROBS DEBUG] Retrieved {len(db_messages) if db_messages else 0} messages from database")
+            if db_messages:
+                for i, message in enumerate(data["messages"]):
+                    if message.get("id") and message["id"] in db_messages:
+                        db_message = db_messages[message["id"]]
+                        log.debug(f"[LOGPROBS DEBUG] Message {message['id']} db keys: {list(db_message.keys())}")
+                        # Add logprobs from database if available
+                        if "logprobs" in db_message:
+                            data["messages"][i]["logprobs"] = db_message["logprobs"]
+                            log.debug(f"[LOGPROBS DEBUG] Added logprobs to message {message['id']}: {len(db_message['logprobs']) if isinstance(db_message['logprobs'], list) else 'not a list'}")
+                        else:
+                            log.debug(f"[LOGPROBS DEBUG] No logprobs found for message {message['id']}")
+        except Exception as e:
+            log.debug(f"Error enriching messages with logprobs: {e}")
 
     try:
         data = await process_pipeline_outlet_filter(request, data, user, models)

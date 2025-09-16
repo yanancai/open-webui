@@ -310,3 +310,8 @@ dist
 cypress/videos
 cypress/screenshots
 .vscode/settings.json
+
+backend/open_webui/frontend/_app/*
+backend/open_webui/static/pyodide
+backend/open_webui/static
+backend/open_webui/frontend

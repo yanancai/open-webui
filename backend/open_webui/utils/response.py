@@ -84,6 +84,8 @@ def convert_response_ollama_to_openai(ollama_response: dict) -> dict:
     message_content = ollama_response.get("message", {}).get("content", "")
     reasoning_content = ollama_response.get("message", {}).get("thinking", None)
     tool_calls = ollama_response.get("message", {}).get("tool_calls", None)
+    logprobs = ollama_response.get("message", {}).get("logprobs", None)
+    
     openai_tool_calls = None
 
     if tool_calls:
@@ -94,7 +96,7 @@ def convert_response_ollama_to_openai(ollama_response: dict) -> dict:
     usage = convert_ollama_usage_to_openai(data)
 
     response = openai_chat_completion_message_template(
-        model, message_content, reasoning_content, openai_tool_calls, usage
+        model, message_content, reasoning_content, openai_tool_calls, usage, logprobs
     )
     return response
 
@@ -102,12 +104,19 @@ def convert_response_ollama_to_openai(ollama_response: dict) -> dict:
 async def convert_streaming_response_ollama_to_openai(ollama_streaming_response):
     async for data in ollama_streaming_response.body_iterator:
         data = json.loads(data)
+        
+        # Debug: Print each chunk to see logprobs
+        print(f"[DEBUG] Streaming chunk: {json.dumps(data, indent=2, default=str)}")
 
         model = data.get("model", "ollama")
         message_content = data.get("message", {}).get("content", None)
         reasoning_content = data.get("message", {}).get("thinking", None)
         tool_calls = data.get("message", {}).get("tool_calls", None)
+        logprobs = data.get("message", {}).get("logprobs", None)
         openai_tool_calls = None
+
+        if logprobs:
+            print(f"[DEBUG] Found logprobs in chunk: {logprobs}")
 
         if tool_calls:
             openai_tool_calls = convert_ollama_tool_call_to_openai(tool_calls)
@@ -119,13 +128,70 @@ async def convert_streaming_response_ollama_to_openai(ollama_streaming_response)
             usage = convert_ollama_usage_to_openai(data)
 
         data = openai_chat_chunk_message_template(
-            model, message_content, reasoning_content, openai_tool_calls, usage
+            model, message_content, reasoning_content, openai_tool_calls, usage, logprobs
         )
 
         line = f"data: {json.dumps(data)}\n\n"
         yield line
 
     yield "data: [DONE]\n\n"
+
+
+async def convert_streaming_ollama_to_complete_response(ollama_streaming_response):
+    """
+    Convert streaming Ollama response to a complete non-streaming OpenAI response.
+    Used when logprobs are requested but user wants non-streaming response.
+    """
+    model = None
+    complete_content = ""
+    complete_logprobs = []
+    usage_data = None
+    tool_calls = None
+    reasoning_content = None
+    
+    async for data in ollama_streaming_response.body_iterator:
+        data = json.loads(data)
+        print(f"[DEBUG] Processing streaming chunk for complete response: {json.dumps(data, indent=2, default=str)}")
+        
+        model = data.get("model", "ollama")
+        message = data.get("message", {})
+        content = message.get("content", "")
+        logprobs = message.get("logprobs", None)
+        
+        # Accumulate content
+        if content:
+            complete_content += content
+            
+        # Accumulate logprobs
+        if logprobs:
+            if isinstance(logprobs, list):
+                complete_logprobs.extend(logprobs)
+            else:
+                complete_logprobs.append(logprobs)
+                
+        # Get tool calls and reasoning from any chunk that has them
+        if message.get("tool_calls"):
+            tool_calls = message.get("tool_calls")
+        if message.get("thinking"):
+            reasoning_content = message.get("thinking")
+            
+        # Get usage data from final chunk
+        done = data.get("done", False)
+        if done:
+            usage_data = convert_ollama_usage_to_openai(data)
+            break
+    
+    print(f"[DEBUG] Complete response - content length: {len(complete_content)}, logprobs count: {len(complete_logprobs)}")
+    
+    # Convert to OpenAI format
+    openai_tool_calls = None
+    if tool_calls:
+        openai_tool_calls = convert_ollama_tool_call_to_openai(tool_calls)
+    
+    response = openai_chat_completion_message_template(
+        model, complete_content, reasoning_content, openai_tool_calls, usage_data, complete_logprobs
+    )
+    return response
 
 
 def convert_embedding_response_ollama_to_openai(response) -> dict:
