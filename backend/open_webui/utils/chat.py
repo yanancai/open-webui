@@ -49,7 +49,6 @@ from open_webui.utils.payload import convert_payload_openai_to_ollama
 from open_webui.utils.response import (
     convert_response_ollama_to_openai,
     convert_streaming_response_ollama_to_openai,
-    convert_streaming_ollama_to_complete_response,
 )
 from open_webui.utils.filter import (
     get_sorted_filter_ids,
@@ -261,13 +260,6 @@ async def generate_chat_completion(
             # Using /ollama/api/chat endpoint
             form_data = convert_payload_openai_to_ollama(form_data)
             
-            # Force streaming for Ollama when logprobs are requested (Ollama only returns logprobs in streaming mode)
-            original_stream = form_data.get("stream", False)
-            logprobs_requested = form_data.get("options", {}).get("logprobs", False)
-            if logprobs_requested and not original_stream:
-                print(f"[DEBUG] Forcing streaming for Ollama logprobs (originally stream={original_stream})")
-                form_data["stream"] = True
-            
             response = await generate_ollama_chat_completion(
                 request=request,
                 form_data=form_data,
@@ -276,17 +268,12 @@ async def generate_chat_completion(
             )
             
             if form_data.get("stream"):
-                if logprobs_requested and not original_stream:
-                    # Convert streaming to non-streaming for logprobs
-                    print(f"[DEBUG] Converting streaming response back to non-streaming for logprobs")
-                    return await convert_streaming_ollama_to_complete_response(response)
-                else:
-                    response.headers["content-type"] = "text/event-stream"
-                    return StreamingResponse(
-                        convert_streaming_response_ollama_to_openai(response),
-                        headers=dict(response.headers),
-                        background=response.background,
-                    )
+                response.headers["content-type"] = "text/event-stream"
+                return StreamingResponse(
+                    convert_streaming_response_ollama_to_openai(response),
+                    headers=dict(response.headers),
+                    background=response.background,
+                )
             else:
                 return convert_response_ollama_to_openai(response)
         else:

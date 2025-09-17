@@ -50,6 +50,8 @@ class Filter:
         self.processed_messages = set()  # Track which messages have been processed to avoid duplicates
         self.current_chat_id = None  # Track current conversation
         self.conversation_turn_count = 0  # Track conversation turns for refresh detection
+        self.streaming_processed_chats = set()  # Track chats that were processed during streaming
+        self.chat_id_mapping = {}  # Map streaming IDs to final chat IDs
 
     def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         """
@@ -86,8 +88,7 @@ class Filter:
     def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
         """
         Process the response and add heatmap visualization if logprobs are present.
-        Only processes NEW messages to prevent duplicate artifacts.
-        Open WebUI provides responses in a normalized format with logprobs already extracted.
+        Only processes NON-STREAMING responses since streaming responses are handled in real-time.
         """
         # Immediately return if disabled - no processing at all
         if not self.toggle:
@@ -100,6 +101,70 @@ class Filter:
                 
                 # Get chat context for artifact refresh logic
                 chat_id = body.get("chat_id", "unknown")
+                
+                # Check if this chat was already processed during streaming to prevent duplication
+                # Also check if any streaming chat ID maps to this final chat ID
+                streaming_processed = False
+                if chat_id in self.streaming_processed_chats:
+                    streaming_processed = True
+                    print(f"⚠️ SKIPPING outlet processing for chat {chat_id} - already processed during streaming")
+                else:
+                    # Check if any streaming IDs were mapped to this chat ID
+                    for streaming_id in list(self.streaming_processed_chats):
+                        if streaming_id.startswith("llama3.1:latest-") and chat_id in self.chat_id_mapping.get(streaming_id, []):
+                            streaming_processed = True
+                            print(f"⚠️ SKIPPING outlet processing for chat {chat_id} - mapped from streaming ID {streaming_id}")
+                            break
+                    
+                    # Additional check: if we have any recent streaming activity, skip outlet processing
+                    # This handles cases where streaming and outlet have different chat ID formats
+                    current_time = time.time()
+                    for streaming_id in list(self.streaming_processed_chats):
+                        if streaming_id.startswith("llama3.1:latest-"):
+                            # Check if this streaming session was very recent (within last 5 seconds)
+                            streaming_final_key = f"{streaming_id}:streaming-final:processed"
+                            if streaming_final_key in self.processed_messages:
+                                streaming_processed = True
+                                print(f"⚠️ SKIPPING outlet processing for chat {chat_id} - recent streaming activity detected from {streaming_id}")
+                                # Map this outlet chat_id to the streaming ID for future reference
+                                if streaming_id not in self.chat_id_mapping:
+                                    self.chat_id_mapping[streaming_id] = []
+                                self.chat_id_mapping[streaming_id].append(chat_id)
+                                break
+                
+                if streaming_processed:
+                    # Clean up the streaming processed marker
+                    self.streaming_processed_chats.discard(chat_id)
+                    return body
+                
+                print(f"🔄 OUTLET processing non-streaming response for chat {chat_id}")
+                
+                # Additional check: if we see any message with very recent processing, it might be from streaming conversion
+                # Check if any assistant message was very recently processed (within last 2 seconds)
+                current_time = time.time()
+                for message in body["messages"]:
+                    if message.get("role") == "assistant":
+                        message_id = message.get("id", "unknown")
+                        message_key_pattern = f"{chat_id}:{message_id}:processed"
+                        
+                        # If we find this message was recently processed, skip outlet processing
+                        if message_key_pattern in self.processed_messages:
+                            print(f"⚠️ SKIPPING outlet processing - message {message_id} was recently processed (likely streaming conversion)")
+                            return body
+                
+                # Check for streaming-final marker to detect converted streaming responses
+                streaming_final_key = None
+                for streaming_id in self.streaming_processed_chats:
+                    if f"{streaming_id}:streaming-final:processed" in self.processed_messages:
+                        streaming_final_key = streaming_id
+                        print(f"⚠️ SKIPPING outlet processing - detected streaming conversion from {streaming_id} to {chat_id}")
+                        # Add mapping for future reference
+                        if streaming_id not in self.chat_id_mapping:
+                            self.chat_id_mapping[streaming_id] = []
+                        self.chat_id_mapping[streaming_id].append(chat_id)
+                        self.streaming_processed_chats.discard(streaming_id)
+                        return body
+                
                 # Reduce verbose logging to prevent performance issues
                 if len(self.processed_messages) % 10 == 0:  # Log every 10 messages
                     print(f"🔍 MESSAGE MANAGEMENT - Processing chat: {chat_id}")
@@ -143,7 +208,7 @@ class Filter:
                         self.processed_messages.add(unique_message_key)
                         print(f"✅ MARKED AS PROCESSED: {unique_message_key}")
                         
-                        # Generate heatmap HTML for this new message
+                        # Generate heatmap HTML for this new message (non-streaming)
                         heatmap_html = self._create_heatmap_html(content, logprobs_data, self.conversation_turn_count)
                         
                         if heatmap_html:
@@ -185,8 +250,8 @@ class Filter:
 
     def stream(self, event: dict) -> dict:
         """
-        Process streaming chunks in real-time to build incremental heatmap visualization.
-        Open WebUI provides streaming data in OpenAI-compatible format.
+        Process streaming chunks in real-time to build and update heatmap visualization progressively.
+        Each chunk updates the artifact with new tokens as they arrive.
         """
         # Immediately return if disabled - no processing at all
         if not self.toggle:
@@ -209,21 +274,21 @@ class Filter:
                     "logprobs": [],
                     "top_logprobs": [],
                     "content_so_far": "",
-                    "last_heatmap": "",
                     "chunk_count": 0,
                     "logprob_chunks": 0,
-                    "start_time": None
+                    "start_time": time.time(),
+                    "artifact_generated": False,
+                    "last_update_time": 0
                 }
-                
-                # Import time for tracking
-                import time
-                self.streaming_state[chat_id]["start_time"] = time.time()
+                print(f"🆕 INITIALIZED streaming state for chat {chat_id}")
             
             state = self.streaming_state[chat_id]
             state["chunk_count"] += 1
             
             # Process choices in the streaming event
             choices = event.get("choices", [])
+            content_updated = False
+            logprobs_updated = False
             
             for choice_idx, choice in enumerate(choices):
                 delta = choice.get("delta", {})
@@ -232,15 +297,22 @@ class Filter:
                 if "content" in delta:
                     content_chunk = delta["content"]
                     state["content_so_far"] += content_chunk
+                    content_updated = True
                 
-                # Handle logprobs updates (OpenAI format)
+                # Handle logprobs updates - check both delta.logprobs and choice.logprobs
                 logprobs = delta.get("logprobs")
+                choice_logprobs = choice.get("logprobs")
+                
+                # Process delta logprobs (typical streaming format)
                 if logprobs:
                     state["logprob_chunks"] += 1
+                    logprobs_updated = True
+                    print(f"[DEBUG] Found logprobs in delta: {logprobs}")
                     
                     # Handle OpenAI format: logprobs.content is an array
                     if isinstance(logprobs, dict) and "content" in logprobs:
                         content_logprobs = logprobs["content"]
+                        print(f"[DEBUG] Processing delta content_logprobs: {len(content_logprobs) if isinstance(content_logprobs, list) else 'not a list'}")
                         
                         if isinstance(content_logprobs, list):
                             for token_idx, token_logprob in enumerate(content_logprobs):
@@ -252,11 +324,64 @@ class Filter:
                                     state["tokens"].append(token)
                                     state["logprobs"].append(logprob)
                                     state["top_logprobs"].append(top_logprobs)
+                                    print(f"[DEBUG] Added token from delta: '{token}' (total: {len(state['tokens'])})")
+                
+                # Process choice logprobs (alternative format - what we're seeing in the logs)
+                elif choice_logprobs:
+                    state["logprob_chunks"] += 1
+                    logprobs_updated = True
+                    print(f"[DEBUG] Found logprobs in choice: {choice_logprobs}")
+                    
+                    # Handle choice logprobs format: choice.logprobs.content is an array
+                    if isinstance(choice_logprobs, dict) and "content" in choice_logprobs:
+                        content_logprobs = choice_logprobs["content"]
+                        print(f"[DEBUG] Processing choice content_logprobs: {len(content_logprobs) if isinstance(content_logprobs, list) else 'not a list'}")
+                        
+                        if isinstance(content_logprobs, list):
+                            for token_idx, token_logprob in enumerate(content_logprobs):
+                                if isinstance(token_logprob, dict):
+                                    token = token_logprob.get("token", "")
+                                    logprob = token_logprob.get("logprob", None)
+                                    top_logprobs = token_logprob.get("top_logprobs", [])
+                                    
+                                    state["tokens"].append(token)
+                                    state["logprobs"].append(logprob)
+                                    state["top_logprobs"].append(top_logprobs)
+                                    print(f"[DEBUG] Added token from choice: '{token}' (total: {len(state['tokens'])})")
+                    else:
+                        print(f"[DEBUG] Choice logprobs format not recognized: {type(choice_logprobs)}")
+                
+                if not logprobs and not choice_logprobs:
+                    print(f"[DEBUG] No logprobs found in this chunk (delta or choice)")
+                else:
+                    print(f"[DEBUG] Logprobs processing complete for this chunk")
+                
+                # Generate/update heatmap artifact progressively - but don't inject into stream yet
+                if logprobs_updated and len(state["tokens"]) > 0:
+                    current_time = time.time()
+                    # Update internal state every 0.5 seconds or when we have significant new content
+                    if (current_time - state["last_update_time"] > 0.5) or len(state["tokens"]) % 3 == 0:
+                        # Just track that we should update, don't modify the stream content yet
+                        state["last_update_time"] = current_time
+                        if len(state["tokens"]) % 5 == 0:  # Log every 5 tokens
+                            print(f"🔄 Streaming heatmap ready - {len(state['tokens'])} tokens collected")
                 
                 # Check if this is the final chunk
                 finish_reason = choice.get("finish_reason")
                 if finish_reason:
                     print(f"🏁 STREAM FINISHED for chat {chat_id} - turn {self.conversation_turn_count}")
+                    print(f"[DEBUG] Final streaming state - tokens collected: {len(state['tokens'])}")
+                    
+                    # Generate final heatmap with all tokens and inject it into the final chunk
+                    if len(state["tokens"]) > 0:
+                        print(f"[DEBUG] Generating final streaming heatmap for {len(state['tokens'])} tokens")
+                        self._finalize_streaming_heatmap(chat_id, state, choice)
+                    else:
+                        print(f"[DEBUG] No tokens collected during streaming - cannot generate heatmap")
+                    
+                    # Mark this chat as having been processed during streaming
+                    self.streaming_processed_chats.add(chat_id)
+                    print(f"📝 MARKED chat {chat_id} as streaming-processed to prevent outlet duplication")
                     
                     # Clean up the streaming state immediately
                     if chat_id in self.streaming_state:
@@ -348,6 +473,11 @@ class Filter:
             del self.streaming_state[old_chat_id]
             print(f"🧹 Cleared streaming state from previous conversation")
         
+        # Clear streaming processed markers from previous conversation  
+        if old_chat_id:
+            self.streaming_processed_chats.discard(old_chat_id)
+            print(f"🧹 Cleared streaming processed marker from previous conversation")
+        
         print(f"✅ State refreshed - ready for new conversation {new_chat_id}")
 
     def _cleanup_resources(self) -> None:
@@ -373,9 +503,65 @@ class Filter:
                 recent_messages = list(self.processed_messages)[-25:]
                 self.processed_messages = set(recent_messages)
                 print(f"🧹 Aggressive cleanup: reduced to {len(self.processed_messages)} processed messages")
+            
+            # Clean up old streaming processed chat markers
+            if len(self.streaming_processed_chats) > 20:
+                # Keep only the most recent 10
+                recent_chats = list(self.streaming_processed_chats)[-10:]
+                self.streaming_processed_chats = set(recent_chats)
+                print(f"🧹 Cleaned up streaming processed chats: {len(self.streaming_processed_chats)} entries remaining")
                 
         except Exception as e:
             print(f"⚠️ Error during resource cleanup: {e}")
+
+    def _finalize_streaming_heatmap(self, chat_id: str, state: dict, choice: dict) -> None:
+        """
+        Generate the final heatmap artifact when streaming is complete and inject it into the final chunk
+        """
+        try:
+            tokens = state["tokens"]
+            token_logprobs = state["logprobs"]
+            top_logprobs = state["top_logprobs"]
+            
+            print(f"[DEBUG] _finalize_streaming_heatmap called with {len(tokens)} tokens")
+            
+            if len(tokens) == 0:
+                print(f"[DEBUG] No tokens to process in finalization")
+                return
+            
+            # Generate final heatmap HTML
+            heatmap_html = self._generate_heatmap_html(tokens, token_logprobs, top_logprobs, self.conversation_turn_count, is_streaming=False)
+            
+            print(f"[DEBUG] Generated heatmap HTML length: {len(heatmap_html) if heatmap_html else 0}")
+            
+            if heatmap_html:
+                # Add final heatmap to the delta content
+                if "delta" not in choice:
+                    choice["delta"] = {}
+                    print(f"[DEBUG] Created new delta in choice")
+                
+                # Add the heatmap as additional content to the final streaming chunk
+                final_update = f"\n\n{heatmap_html}"
+                
+                if "content" in choice["delta"]:
+                    choice["delta"]["content"] += final_update
+                    print(f"[DEBUG] Appended heatmap to existing delta content")
+                else:
+                    choice["delta"]["content"] = final_update
+                    print(f"[DEBUG] Set heatmap as new delta content")
+                
+                # Mark as processed to avoid outlet duplication
+                unique_message_key = f"{chat_id}:streaming-final:processed"
+                self.processed_messages.add(unique_message_key)
+                
+                print(f"✅ FINAL STREAMING HEATMAP GENERATED and injected - {len(tokens)} tokens analyzed")
+            else:
+                print(f"[DEBUG] Heatmap HTML generation returned empty result")
+            
+        except Exception as e:
+            print(f"❌ Error finalizing streaming heatmap: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _create_heatmap_html(self, content: str, logprobs_data: list, turn: int) -> str:
         """
@@ -398,9 +584,10 @@ class Filter:
 
         return self._generate_heatmap_html(tokens, token_logprobs, top_logprobs, turn)
 
-    def _generate_heatmap_html(self, tokens: list, token_logprobs: list, top_logprobs: list, turn: int) -> str:
+    def _generate_heatmap_html(self, tokens: list, token_logprobs: list, top_logprobs: list, turn: int, is_streaming: bool = False) -> str:
         """
-        Generate HTML code block that Open WebUI will render as an artifact with turn-based versioning
+        Generate HTML code block that Open WebUI will render as an artifact with turn-based versioning.
+        Supports both streaming updates and final artifacts.
         """
 
         # Validate that we have matching data
@@ -461,8 +648,13 @@ class Filter:
             html_content.append(token_span)
 
         # Add unique artifact ID with turn-based versioning for Open WebUI artifact system
-        artifact_id = f"logprobs-heatmap-turn{turn}-{int(time.time())}"
+        streaming_suffix = "-streaming" if is_streaming else ""
+        artifact_id = f"logprobs-heatmap-turn{turn}{streaming_suffix}-{int(time.time())}"
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Determine title and status based on streaming state
+        title_prefix = "🔄 Live" if is_streaming else "🎯 Final"
+        status_text = f"Streaming: {len(tokens)} tokens so far..." if is_streaming else f"Complete: {len(tokens)} tokens analyzed"
 
         # Create the full HTML artifact with turn-based versioning
         artifact_html = f'''<!DOCTYPE html>
@@ -470,8 +662,8 @@ class Filter:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Token Probability Heatmap - Turn {turn}</title>
-    <!-- Conversation Turn: {turn} | Generated: {timestamp} -->
+    <title>{title_prefix} Token Probability Heatmap - Turn {turn}</title>
+    <!-- Conversation Turn: {turn} | Generated: {timestamp} | Streaming: {is_streaming} -->
     <style>
         body {{
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -511,13 +703,13 @@ class Filter:
             font-size: 1.1rem;
         }}
         .turn-info {{
-            background: #e8f5e8;
+            background: {"#fff3cd" if is_streaming else "#e8f5e8"};
             border-radius: 5px;
             padding: 8px;
             margin: 10px 0;
             font-size: 0.9rem;
-            color: #2d5a2d;
-            border-left: 4px solid #4caf50;
+            color: {"#856404" if is_streaming else "#2d5a2d"};
+            border-left: 4px solid {"#ffc107" if is_streaming else "#4caf50"};
         }}
         .text-content {{
             background: #fafbfc;
@@ -596,17 +788,17 @@ class Filter:
 <body data-artifact-id="{artifact_id}">
     <div class="container">
         <div class="header">
-            <h1 class="title">🎯 Token Probability Heatmap</h1>
+            <h1 class="title">{title_prefix} Token Probability Heatmap</h1>
             <p class="subtitle">💡 Hover over tokens to see detailed probability information and alternatives</p>
             <div class="turn-info">
-                📦 Conversation Turn: {turn} | Generated: {timestamp}
+                📦 Conversation Turn: {turn} | Generated: {timestamp} | {status_text}
             </div>
         </div>
 
         <div class="text-content" id="text-content">{"".join(html_content)}</div>
         
         <div class="footer">
-            📊 **Stats:** {len(tokens)} tokens analyzed with ranking-based confidence visualization
+            📊 **Stats:** {status_text} with ranking-based confidence visualization
         </div>
     </div>
 
@@ -666,13 +858,13 @@ class Filter:
         }});
 
         // Log artifact turn for debugging
-        console.log('Logprobs Heatmap Artifact Turn {turn} loaded at {timestamp}');
+        console.log('{title_prefix} Logprobs Heatmap Artifact Turn {turn} loaded at {timestamp}');
     </script>
 </body>
 </html>'''
 
         # Return as a code block that Open WebUI will detect and render as an artifact
-        result = f"\n\n🎯 **Token Probability Heatmap Generated!** (Conversation Turn {turn})\n\n```html\n{artifact_html}\n```\n\n📊 **Stats:** {len(tokens)} tokens analyzed with confidence visualization | Artifact ID: `{artifact_id}`\n"
+        result = f"\n\n{title_prefix} **Token Probability Heatmap Generated!** (Conversation Turn {turn})\n\n```html\n{artifact_html}\n```\n\n📊 **Stats:** {status_text} | Artifact ID: `{artifact_id}`\n"
         
         return result
 
@@ -722,6 +914,6 @@ class Filter:
 
 
 # Required metadata for Open WebUI
-__version__ = "7.1.0"
+__version__ = "8.0.0"
 __author__ = "Assistant"
-__description__ = "Captures model response tokens and logprobs data to generate interactive HTML artifacts. Creates beautiful, hoverable heatmap visualizations with confidence analysis and detailed statistics. Features NEW MESSAGE ONLY processing to prevent duplicate artifacts. Each conversation turn gets its own unique artifact. Works with all LLM providers through Open WebUI's unified OpenAI-compatible format."
+__description__ = "Real-time streaming token probability heatmap generator. Creates interactive HTML artifacts that update progressively as tokens are generated during streaming. Features live updates during generation and eliminates duplicate processing. Each conversation turn gets its own unique artifact with streaming and final versions. Works with all LLM providers through Open WebUI's unified OpenAI-compatible format."
