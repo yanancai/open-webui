@@ -52,6 +52,7 @@ class Filter:
         self.conversation_turn_count = 0  # Track conversation turns for refresh detection
         self.streaming_processed_chats = set()  # Track chats that were processed during streaming
         self.chat_id_mapping = {}  # Map streaming IDs to final chat IDs
+        self.recent_artifacts = {}  # Track recent artifact generation with timestamps
 
     def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         """
@@ -88,7 +89,7 @@ class Filter:
     def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
         """
         Process the response and add heatmap visualization if logprobs are present.
-        Only processes NON-STREAMING responses since streaming responses are handled in real-time.
+        Handles both streaming and non-streaming response formats.
         """
         # Immediately return if disabled - no processing at all
         if not self.toggle:
@@ -96,136 +97,128 @@ class Filter:
 
         try:
             # Handle the chat completion response structure
-            # In this case, we have: {"messages": [...], "chat_id": "...", ...}
             if "messages" in body and isinstance(body["messages"], list):
                 
-                # Get chat context for artifact refresh logic
                 chat_id = body.get("chat_id", "unknown")
+                print(f"🔄 OUTLET processing response for chat {chat_id}")
+                print(f"🔍 DEBUG: Found {len(body['messages'])} messages in response")
+                print(f"🔍 DEBUG: Response keys: {list(body.keys())}")
                 
-                # Check if this chat was already processed during streaming to prevent duplication
-                # Also check if any streaming chat ID maps to this final chat ID
-                streaming_processed = False
-                if chat_id in self.streaming_processed_chats:
-                    streaming_processed = True
-                    print(f"⚠️ SKIPPING outlet processing for chat {chat_id} - already processed during streaming")
-                else:
-                    # Check if any streaming IDs were mapped to this chat ID
-                    for streaming_id in list(self.streaming_processed_chats):
-                        if streaming_id.startswith("llama3.1:latest-") and chat_id in self.chat_id_mapping.get(streaming_id, []):
-                            streaming_processed = True
-                            print(f"⚠️ SKIPPING outlet processing for chat {chat_id} - mapped from streaming ID {streaming_id}")
-                            break
-                    
-                    # Additional check: if we have any recent streaming activity, skip outlet processing
-                    # This handles cases where streaming and outlet have different chat ID formats
-                    current_time = time.time()
-                    for streaming_id in list(self.streaming_processed_chats):
-                        if streaming_id.startswith("llama3.1:latest-"):
-                            # Check if this streaming session was very recent (within last 5 seconds)
-                            streaming_final_key = f"{streaming_id}:streaming-final:processed"
-                            if streaming_final_key in self.processed_messages:
-                                streaming_processed = True
-                                print(f"⚠️ SKIPPING outlet processing for chat {chat_id} - recent streaming activity detected from {streaming_id}")
-                                # Map this outlet chat_id to the streaming ID for future reference
-                                if streaming_id not in self.chat_id_mapping:
-                                    self.chat_id_mapping[streaming_id] = []
-                                self.chat_id_mapping[streaming_id].append(chat_id)
-                                break
-                
-                if streaming_processed:
-                    # Clean up the streaming processed marker
-                    self.streaming_processed_chats.discard(chat_id)
-                    return body
-                
-                print(f"🔄 OUTLET processing non-streaming response for chat {chat_id}")
-                
-                # Additional check: if we see any message with very recent processing, it might be from streaming conversion
-                # Check if any assistant message was very recently processed (within last 2 seconds)
-                current_time = time.time()
+                # Find assistant messages with logprobs and process them
+                found_assistant = False
                 for message in body["messages"]:
                     if message.get("role") == "assistant":
-                        message_id = message.get("id", "unknown")
-                        message_key_pattern = f"{chat_id}:{message_id}:processed"
-                        
-                        # If we find this message was recently processed, skip outlet processing
-                        if message_key_pattern in self.processed_messages:
-                            print(f"⚠️ SKIPPING outlet processing - message {message_id} was recently processed (likely streaming conversion)")
-                            return body
-                
-                # Check for streaming-final marker to detect converted streaming responses
-                streaming_final_key = None
-                for streaming_id in self.streaming_processed_chats:
-                    if f"{streaming_id}:streaming-final:processed" in self.processed_messages:
-                        streaming_final_key = streaming_id
-                        print(f"⚠️ SKIPPING outlet processing - detected streaming conversion from {streaming_id} to {chat_id}")
-                        # Add mapping for future reference
-                        if streaming_id not in self.chat_id_mapping:
-                            self.chat_id_mapping[streaming_id] = []
-                        self.chat_id_mapping[streaming_id].append(chat_id)
-                        self.streaming_processed_chats.discard(streaming_id)
-                        return body
-                
-                # Reduce verbose logging to prevent performance issues
-                if len(self.processed_messages) % 10 == 0:  # Log every 10 messages
-                    print(f"🔍 MESSAGE MANAGEMENT - Processing chat: {chat_id}")
-                    print(f"🔍 Current conversation state: chat_id={self.current_chat_id}, turn={self.conversation_turn_count}")
-                    print(f"🔍 Processed messages count: {len(self.processed_messages)}")
-                
-                # Find assistant messages with logprobs, but only process NEW ones (not already processed)
-                new_assistant_messages = []
-                for message in body["messages"]:
+                        found_assistant = True
                     if message.get("role") == "assistant":
+                        content = message.get("content", "")
+                        logprobs_data = message.get("logprobs")
                         message_id = message.get("id", "unknown")
-                        # Check if this message was already processed (any version)
-                        base_message_key = f"{chat_id}:{message_id}"
-                        already_processed = any(key.startswith(base_message_key) for key in self.processed_messages)
                         
-                        # Reduce verbose logging to prevent performance issues
-                        if not already_processed:
-                            print(f"🆔 FOUND new assistant message - ID: {message_id}")
-                            print(f"📊 Logprobs present: {bool(message.get('logprobs'))}")
-                        
-                        if not already_processed:
-                            new_assistant_messages.append(message)
-                        else:
-                            print(f"⚠️ SKIPPING already processed message: {message_id}")
-                
-                # Process only the NEW assistant messages (typically just one per turn)
-                for message in new_assistant_messages:
-                    content = message.get("content", "")
-                    logprobs_data = message.get("logprobs")
-                    message_id = message.get("id", "unknown")
-                    
-                    if logprobs_data and content.strip():
-                        # Create a unique key for this specific message
-                        unique_message_key = f"{chat_id}:{message_id}:processed"
-                        
-                        print(f"🔑 PROCESSING NEW MESSAGE: {message_id}")
+                        print(f"🔍 DEBUG: Found assistant message {message_id}")
                         print(f"📝 Content length: {len(content)} chars")
-                        print(f"📊 Logprobs tokens: {len(logprobs_data) if logprobs_data else 0}")
+                        print(f"📊 Logprobs present: {bool(logprobs_data)}")
                         
-                        # Mark this specific message as processed
-                        self.processed_messages.add(unique_message_key)
-                        print(f"✅ MARKED AS PROCESSED: {unique_message_key}")
+                        if logprobs_data:
+                            print(f"📊 Logprobs data type: {type(logprobs_data)}")
+                            if isinstance(logprobs_data, list):
+                                print(f"📊 Logprobs tokens: {len(logprobs_data)}")
+                            elif isinstance(logprobs_data, dict):
+                                print(f"📊 Logprobs keys: {list(logprobs_data.keys())}")
                         
-                        # Generate heatmap HTML for this new message (non-streaming)
-                        heatmap_html = self._create_heatmap_html(content, logprobs_data, self.conversation_turn_count)
+                        # Check if already processed to avoid duplicates
+                        unique_message_key = f"{chat_id}:{message_id}:processed"
+                        if unique_message_key in self.processed_messages:
+                            print(f"⚠️ SKIPPING already processed message: {message_id}")
+                            continue
                         
-                        if heatmap_html:
-                            # Append the heatmap to the message content
-                            message["content"] = content + "\n\n" + heatmap_html
-                            print(f"✅ ARTIFACT GENERATED for NEW message {message_id} (turn {self.conversation_turn_count})")
+                        # Check for recent artifact generation to prevent duplicates from streaming
+                        current_time = time.time()
                         
-                        # Keep logprobs for UI access
-                        if not message.get("logprobs"):
+                        # Check if this came from streaming (different chat ID patterns)
+                        is_likely_from_streaming = any(
+                            streaming_id in chat_id or chat_id in streaming_id
+                            for streaming_id in self.streaming_processed_chats
+                        )
+                        
+                        if is_likely_from_streaming:
+                            print(f"⚠️ SKIPPING - outlet message likely from recent streaming for chat pattern: {chat_id}")
+                            continue
+                        
+                        # Also check timestamp-based recent artifacts
+                        turn_key = f"turn{self.conversation_turn_count}"
+                        if turn_key in self.recent_artifacts:
+                            last_artifact_time = self.recent_artifacts[turn_key]
+                            if current_time - last_artifact_time < 5:  # Within last 5 seconds
+                                print(f"⚠️ SKIPPING - artifact for turn {self.conversation_turn_count} was generated {current_time - last_artifact_time:.1f}s ago")
+                                continue
+                        
+                        # Check if this message already contains a heatmap artifact to prevent duplicates
+                        if "logprobs-heatmap" in content:
+                            print(f"⚠️ SKIPPING - message {message_id} already contains heatmap artifact")
+                            continue
+                        
+                        # Check if we have content but no logprobs (logprobs were dropped due to truncation)
+                        if content.strip() and not logprobs_data:
+                            print(f"📝 CONTENT WITHOUT LOGPROBS detected - text length: {len(content)} chars")
+                            print(f"💡 This likely means logprobs were truncated due to token limit")
+                            print(f"✅ Displaying text without heatmap for message {message_id}")
+                            # Keep the content as-is, no heatmap needed
+                            continue
+                        
+                        # Process if we have logprobs (regardless of content being empty)
+                        if logprobs_data:
+                            print(f"🔑 PROCESSING MESSAGE: {message_id}")
+                            
+                            # If content is empty but we have logprobs, reconstruct content from tokens
+                            original_content_empty = not content.strip()
+                            if original_content_empty and logprobs_data:
+                                print(f"📝 Content is empty, reconstructing from logprobs tokens")
+                                content = self._reconstruct_content_from_logprobs(logprobs_data)
+                                print(f"📝 Reconstructed content length: {len(content)} chars")
+                                # Update the message content with reconstructed text
+                                message["content"] = content
+                            
+                            # Additional check: if we still have no content, there's a problem
+                            if not content.strip():
+                                print(f"❌ ERROR: Still no content after reconstruction attempt")
+                                print(f"    - Original content empty: {original_content_empty}")
+                                print(f"    - Logprobs type: {type(logprobs_data)}")
+                                print(f"    - Logprobs length: {len(logprobs_data) if isinstance(logprobs_data, list) else 'not a list'}")
+                                continue
+                            
+                            # Mark this specific message as processed
+                            self.processed_messages.add(unique_message_key)
+                            print(f"✅ MARKED AS PROCESSED: {unique_message_key}")
+                            
+                            # Generate heatmap HTML for this message
+                            heatmap_html = self._create_heatmap_html(content, logprobs_data, self.conversation_turn_count)
+                            
+                            if heatmap_html:
+                                # Append the heatmap to the message content
+                                message["content"] = content + "\n\n" + heatmap_html
+                                print(f"✅ ARTIFACT GENERATED for message {message_id} (turn {self.conversation_turn_count})")
+                                
+                                # Record artifact generation timestamp to prevent duplicates
+                                self.recent_artifacts[f"turn{self.conversation_turn_count}"] = time.time()
+                            else:
+                                print(f"❌ Failed to generate heatmap HTML for message {message_id}")
+                            
+                            # Keep logprobs for UI access
                             message["logprobs"] = logprobs_data
-                        
-                        # Process only the first new message to avoid multiple artifacts per turn
-                        break
-                    elif not logprobs_data:
-                        print(f"⚠️ No logprobs found in NEW message {message_id}")
-                    elif not content.strip():
-                        print(f"⚠️ NEW message {message_id} has logprobs but no content")
+                            
+                            # Process only the first message with logprobs to avoid multiple artifacts
+                            break
+                        else:
+                            # No logprobs found - this is normal when logprobs are truncated
+                            if content.strip():
+                                print(f"📝 Message {message_id} has content ({len(content)} chars) but no logprobs - likely truncated")
+                            else:
+                                print(f"⚠️ Message {message_id} has no content and no logprobs")
+                
+                if not found_assistant:
+                    print(f"⚠️ No assistant messages found in response")
+                else:
+                    print(f"✅ Found assistant messages, but may have been skipped due to duplicates or missing logprobs")
                 
                 # Clean up processed messages more aggressively to prevent memory leaks
                 if len(self.processed_messages) > 100:
@@ -233,9 +226,6 @@ class Filter:
                     recent_messages = list(self.processed_messages)[-50:]
                     self.processed_messages = set(recent_messages)
                     print(f"🧹 Cleaned up processed messages cache: {len(self.processed_messages)} entries remaining")
-                
-                if not new_assistant_messages:
-                    print("⚠️ No NEW assistant messages with logprobs found")
                 
                 return body
 
@@ -372,12 +362,18 @@ class Filter:
                     print(f"🏁 STREAM FINISHED for chat {chat_id} - turn {self.conversation_turn_count}")
                     print(f"[DEBUG] Final streaming state - tokens collected: {len(state['tokens'])}")
                     
-                    # Generate final heatmap with all tokens and inject it into the final chunk
-                    if len(state["tokens"]) > 0:
-                        print(f"[DEBUG] Generating final streaming heatmap for {len(state['tokens'])} tokens")
+                    # Check if we have any tokens with logprobs to generate heatmap
+                    if len(state["tokens"]) > 0 and any(lp is not None for lp in state["logprobs"]):
+                        print(f"[DEBUG] Generating final streaming heatmap for {len(state['tokens'])} tokens with logprobs")
                         self._finalize_streaming_heatmap(chat_id, state, choice)
                     else:
-                        print(f"[DEBUG] No tokens collected during streaming - cannot generate heatmap")
+                        # Content without logprobs - normal case when logprobs are truncated
+                        content_length = len(state.get("content_so_far", ""))
+                        if content_length > 0:
+                            print(f"[DEBUG] Streaming completed with {content_length} chars but no logprobs - likely truncated due to token limit")
+                            print(f"[DEBUG] This is normal behavior - text will display without heatmap")
+                        else:
+                            print(f"[DEBUG] No content or logprobs collected during streaming")
                     
                     # Mark this chat as having been processed during streaming
                     self.streaming_processed_chats.add(chat_id)
@@ -439,7 +435,7 @@ class Filter:
             self.conversation_turn_count += 1
             # Only log every few turns to reduce verbosity
             if self.conversation_turn_count % 3 == 0:
-                print(f"�️ CONTINUING CONVERSATION {chat_id} - Turn {self.conversation_turn_count}")
+                print(f"🔄 CONTINUING CONVERSATION {chat_id} - Turn {self.conversation_turn_count}")
         else:
             print(f"⚠️ No chat_id detected in request body")
             print(f"📦 Request body keys: {list(body.keys())}")
@@ -504,12 +500,22 @@ class Filter:
                 self.processed_messages = set(recent_messages)
                 print(f"🧹 Aggressive cleanup: reduced to {len(self.processed_messages)} processed messages")
             
-            # Clean up old streaming processed chat markers
-            if len(self.streaming_processed_chats) > 20:
-                # Keep only the most recent 10
-                recent_chats = list(self.streaming_processed_chats)[-10:]
+            # Clean up old streaming processed chat markers more frequently
+            if len(self.streaming_processed_chats) > 10:
+                # Keep only the most recent 5
+                recent_chats = list(self.streaming_processed_chats)[-5:]
                 self.streaming_processed_chats = set(recent_chats)
                 print(f"🧹 Cleaned up streaming processed chats: {len(self.streaming_processed_chats)} entries remaining")
+            
+            # Clean up old artifact timestamps
+            if len(self.recent_artifacts) > 50:
+                current_time = time.time()
+                # Remove artifacts older than 30 seconds
+                old_artifacts = [key for key, timestamp in self.recent_artifacts.items() 
+                               if current_time - timestamp > 30]
+                for key in old_artifacts:
+                    del self.recent_artifacts[key]
+                print(f"🧹 Cleaned up {len(old_artifacts)} old artifact timestamps")
                 
         except Exception as e:
             print(f"⚠️ Error during resource cleanup: {e}")
@@ -554,6 +560,9 @@ class Filter:
                 unique_message_key = f"{chat_id}:streaming-final:processed"
                 self.processed_messages.add(unique_message_key)
                 
+                # Record artifact generation timestamp to prevent duplicates
+                self.recent_artifacts[f"turn{self.conversation_turn_count}"] = time.time()
+                
                 print(f"✅ FINAL STREAMING HEATMAP GENERATED and injected - {len(tokens)} tokens analyzed")
             else:
                 print(f"[DEBUG] Heatmap HTML generation returned empty result")
@@ -563,53 +572,142 @@ class Filter:
             import traceback
             traceback.print_exc()
 
+    def _reconstruct_content_from_logprobs(self, logprobs_data) -> str:
+        """
+        Reconstruct content from logprobs tokens when content is empty.
+        This handles the case where streaming is off but content="" and all logprobs are present.
+        """
+        print(f"🔧 _reconstruct_content_from_logprobs called")
+        
+        # Handle different logprobs data formats
+        if isinstance(logprobs_data, dict) and "content" in logprobs_data:
+            logprobs_data = logprobs_data["content"]
+        
+        if not isinstance(logprobs_data, list):
+            print(f"❌ Cannot reconstruct - logprobs data is not a list: {type(logprobs_data)}")
+            return ""
+        
+        tokens = []
+        for item in logprobs_data:
+            if isinstance(item, dict):
+                token = item.get("token", "")
+                tokens.append(token)
+            else:
+                print(f"⚠️ Unexpected logprob item type: {type(item)}")
+        
+        reconstructed = "".join(tokens)
+        print(f"✅ Reconstructed {len(tokens)} tokens into {len(reconstructed)} chars")
+        return reconstructed
+
     def _create_heatmap_html(self, content: str, logprobs_data: list, turn: int) -> str:
         """
         Create HTML with heatmap styling based on OpenAI-compatible logprobs format with turn-based versioning.
         In Open WebUI's outlet, logprobs_data is already extracted and normalized to a consistent format.
+        Returns empty string if no valid logprobs data is available.
         """
-        if not isinstance(logprobs_data, list) or not logprobs_data:
-            print("Invalid logprobs data format")
-            return content
+        print(f"🔍 _create_heatmap_html called with:")
+        print(f"   - Content length: {len(content) if content else 0}")
+        print(f"   - Logprobs data type: {type(logprobs_data)}")
+        print(f"   - Turn: {turn}")
+        
+        # Early return if no logprobs data - content will be displayed as plain text
+        if not logprobs_data:
+            print(f"❌ No logprobs data provided - returning empty string")
+            print(f"💡 Content will be displayed as plain text without heatmap")
+            return ""
+        
+        if not isinstance(logprobs_data, list):
+            print(f"❌ Invalid logprobs data format - expected list, got {type(logprobs_data)}")
+            if isinstance(logprobs_data, dict):
+                print(f"   - Dict keys: {list(logprobs_data.keys())}")
+                # Try to extract from dict format
+                if "content" in logprobs_data and isinstance(logprobs_data["content"], list):
+                    print(f"   - Found content key with list, using that")
+                    logprobs_data = logprobs_data["content"]
+                else:
+                    print(f"   - No content key or not a list - returning empty string")
+                    return ""
+            else:
+                print(f"❌ Cannot process logprobs data - returning empty string")
+                return ""
+        
+        if not logprobs_data:
+            print(f"❌ Empty logprobs data list - returning empty string")
+            return ""
+
+        print(f"✅ Processing {len(logprobs_data)} logprob entries")
 
         tokens = []
         token_logprobs = []
         top_logprobs = []
 
-        for item in logprobs_data:
+        for i, item in enumerate(logprobs_data):
             if isinstance(item, dict):
-                tokens.append(item.get("token", ""))
-                token_logprobs.append(item.get("logprob", None))
-                top_logprobs.append(item.get("top_logprobs", []))
+                token = item.get("token", "")
+                logprob = item.get("logprob", None)
+                top_lp = item.get("top_logprobs", [])
+                
+                tokens.append(token)
+                token_logprobs.append(logprob)
+                top_logprobs.append(top_lp)
+                
+                if i < 3:  # Log first few for debugging
+                    print(f"   - Token {i}: '{token}' (logprob: {logprob}, alternatives: {len(top_lp)})")
+            else:
+                print(f"   - Item {i} is not a dict: {type(item)}")
 
-        return self._generate_heatmap_html(tokens, token_logprobs, top_logprobs, turn)
+        print(f"✅ Extracted {len(tokens)} tokens, calling _generate_heatmap_html")
+        result = self._generate_heatmap_html(tokens, token_logprobs, top_logprobs, turn)
+        print(f"✅ _generate_heatmap_html returned {len(result) if result else 0} characters")
+        
+        return result
 
     def _generate_heatmap_html(self, tokens: list, token_logprobs: list, top_logprobs: list, turn: int, is_streaming: bool = False) -> str:
         """
         Generate HTML code block that Open WebUI will render as an artifact with turn-based versioning.
         Supports both streaming updates and final artifacts.
+        Returns empty string if no valid logprobs data is available.
         """
+        print(f"🔍 _generate_heatmap_html called with:")
+        print(f"   - Tokens: {len(tokens)}")
+        print(f"   - Token logprobs: {len(token_logprobs)}")
+        print(f"   - Top logprobs: {len(top_logprobs)}")
+        print(f"   - Turn: {turn}")
+        print(f"   - Is streaming: {is_streaming}")
+
+        # Early validation - return empty if no meaningful data
+        if not tokens:
+            print(f"❌ No tokens to process - returning empty string")
+            return ""
+        
+        if not token_logprobs:
+            print(f"❌ No token logprobs to process - returning empty string")
+            print(f"💡 This likely means logprobs were truncated due to token limit")
+            return ""
 
         # Validate that we have matching data
         if len(tokens) != len(token_logprobs):
-            print(f"Token count mismatch: {len(tokens)} tokens vs {len(token_logprobs)} logprobs")
+            print(f"❌ Token count mismatch: {len(tokens)} tokens vs {len(token_logprobs)} logprobs")
             # Truncate to minimum length
             min_len = min(len(tokens), len(token_logprobs))
             tokens = tokens[:min_len]
             token_logprobs = token_logprobs[:min_len]
             top_logprobs = top_logprobs[:min_len] if len(top_logprobs) > min_len else top_logprobs
 
-        if not tokens:
-            return ""
-
         # Calculate probability ranges for color mapping
         valid_logprobs = [lp for lp in token_logprobs if lp is not None]
         if not valid_logprobs:
+            print(f"❌ No valid logprobs found - returning empty string")
+            print(f"💡 All logprobs are None, likely due to truncation at token limit")
             return ""
             
+        print(f"✅ Found {len(valid_logprobs)} valid logprobs out of {len(token_logprobs)} tokens")
+        
         min_logprob = min(valid_logprobs)
         max_logprob = max(valid_logprobs)
         logprob_range = max_logprob - min_logprob if max_logprob != min_logprob else 1
+
+        print(f"✅ Logprob range: {min_logprob:.3f} to {max_logprob:.3f}")
 
         # Build HTML content for the artifact
         html_content = []
@@ -647,14 +745,23 @@ class Filter:
             
             html_content.append(token_span)
 
-        # Add unique artifact ID with turn-based versioning for Open WebUI artifact system
-        streaming_suffix = "-streaming" if is_streaming else ""
-        artifact_id = f"logprobs-heatmap-turn{turn}{streaming_suffix}-{int(time.time())}"
+        # Add unique artifact ID with different prefixes for streaming vs outlet
+        if is_streaming:
+            artifact_prefix = "stream"
+        else:
+            artifact_prefix = "outlet"
+        
+        # Use microseconds for better uniqueness to prevent ID conflicts
+        unique_timestamp = int(time.time() * 1000000)  # microseconds
+        artifact_id = f"logprobs-heatmap-{artifact_prefix}-turn{turn}-{unique_timestamp}"
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         
         # Determine title and status based on streaming state
         title_prefix = "🔄 Live" if is_streaming else "🎯 Final"
         status_text = f"Streaming: {len(tokens)} tokens so far..." if is_streaming else f"Complete: {len(tokens)} tokens analyzed"
+
+        print(f"✅ Generating HTML artifact with ID: {artifact_id}")
+        print(f"✅ Status: {status_text}")
 
         # Create the full HTML artifact with turn-based versioning
         artifact_html = f'''<!DOCTYPE html>
@@ -866,6 +973,10 @@ class Filter:
         # Return as a code block that Open WebUI will detect and render as an artifact
         result = f"\n\n{title_prefix} **Token Probability Heatmap Generated!** (Conversation Turn {turn})\n\n```html\n{artifact_html}\n```\n\n📊 **Stats:** {status_text} | Artifact ID: `{artifact_id}`\n"
         
+        print(f"✅ HTML artifact generated successfully!")
+        print(f"   - Result length: {len(result)} characters")
+        print(f"   - Artifact ID: {artifact_id}")
+        
         return result
 
     def _get_rank_based_color(self, token_index: int, top_logprobs_list: list, current_token: str) -> str:
@@ -914,6 +1025,6 @@ class Filter:
 
 
 # Required metadata for Open WebUI
-__version__ = "8.0.0"
+__version__ = "8.3.0"
 __author__ = "Assistant"
-__description__ = "Real-time streaming token probability heatmap generator. Creates interactive HTML artifacts that update progressively as tokens are generated during streaming. Features live updates during generation and eliminates duplicate processing. Each conversation turn gets its own unique artifact with streaming and final versions. Works with all LLM providers through Open WebUI's unified OpenAI-compatible format."
+__description__ = "Real-time streaming token probability heatmap generator. Creates interactive HTML artifacts that update progressively as tokens are generated during streaming. Features live updates during generation and eliminates duplicate processing. Each conversation turn gets its own unique artifact with streaming and final versions. Works with all LLM providers through Open WebUI's unified OpenAI-compatible format. Intelligently handles logprobs truncation - displays plain text when logprobs are not available, generates heatmaps only when logprobs data is present. Compatible with configurable backend logprobs limits that prevent 'Chunk too big' errors."

@@ -269,10 +269,35 @@ async def generate_chat_completion(
             
             if form_data.get("stream"):
                 response.headers["content-type"] = "text/event-stream"
+                
+                # Create a custom generator that ensures proper cleanup
+                async def safe_streaming_generator():
+                    cleanup_called = False
+                    try:
+                        print(f"[DEBUG] Starting streaming conversion with cleanup safety")
+                        chunk_count = 0
+                        async for chunk in convert_streaming_response_ollama_to_openai(response):
+                            chunk_count += 1
+                            yield chunk
+                        print(f"[DEBUG] Streaming completed successfully with {chunk_count} chunks")
+                    except Exception as e:
+                        print(f"[DEBUG] Error during streaming: {e}")
+                        raise
+                    finally:
+                        # Ensure cleanup happens when the generator is done/closed
+                        if not cleanup_called and response.background:
+                            cleanup_called = True
+                            print(f"[DEBUG] Calling background cleanup task...")
+                            try:
+                                await response.background()
+                                print(f"[DEBUG] Background cleanup completed successfully")
+                            except Exception as cleanup_error:
+                                print(f"[DEBUG] Error during cleanup: {cleanup_error}")
+                
                 return StreamingResponse(
-                    convert_streaming_response_ollama_to_openai(response),
+                    safe_streaming_generator(),
                     headers=dict(response.headers),
-                    background=response.background,
+                    # Don't pass the background task since we handle it manually
                 )
             else:
                 return convert_response_ollama_to_openai(response)

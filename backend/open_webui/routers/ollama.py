@@ -111,10 +111,28 @@ async def cleanup_response(
     response: Optional[aiohttp.ClientResponse],
     session: Optional[aiohttp.ClientSession],
 ):
-    if response:
-        response.close()
-    if session:
-        await session.close()
+    try:
+        if response:
+            # Ensure any remaining content is consumed before closing
+            if not response.closed:
+                try:
+                    # Try to read any remaining content to properly close the response
+                    async for _ in response.content.iter_chunked(8192):
+                        pass
+                except Exception:
+                    pass  # Ignore errors during cleanup
+                finally:
+                    response.close()
+            else:
+                response.close()
+    except Exception as e:
+        print(f"[DEBUG] Error closing response: {e}")
+    
+    try:
+        if session and not session.closed:
+            await session.close()
+    except Exception as e:
+        print(f"[DEBUG] Error closing session: {e}")
 
 
 async def send_post_request(
@@ -129,8 +147,20 @@ async def send_post_request(
 
     r = None
     try:
+        # Create session with enhanced settings for larger responses (e.g., when logprobs are enabled)
+        connector = aiohttp.TCPConnector(
+            limit=100,
+            limit_per_host=30,
+        )
+        
         session = aiohttp.ClientSession(
-            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+            trust_env=True, 
+            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+            connector=connector,
+            # Configure for larger chunks when logprobs are enabled
+            read_bufsize=2**20,  # 1MB buffer instead of default 64KB
+            max_line_size=2**19,  # 512KB max line size instead of default 8KB
+            max_field_size=2**19,  # 512KB max field size instead of default 8KB
         )
 
         r = await session.post(
